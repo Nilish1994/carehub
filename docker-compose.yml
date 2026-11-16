@@ -1,0 +1,63 @@
+# CareHub: an open-source document hub for aged-care admin teams.
+#
+# Built on Paperless-ngx (document storage, OCR, tags, permissions, audit log,
+# built-in AI chat). Runs on any machine with Docker: a VPS, a laptop, or a
+# Mac mini in the office. Copy .env.example to .env, fill it in, then:
+#
+#   docker compose up -d
+#
+# The web app listens on 127.0.0.1:${CAREHUB_PORT} only; put a reverse proxy
+# with HTTPS (nginx, Caddy) in front of it to publish it.
+
+services:
+  broker:
+    image: docker.io/valkey/valkey:9-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    mem_limit: 128m
+
+  webserver:
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2
+    restart: unless-stopped
+    depends_on:
+      - broker
+    ports:
+      - "127.0.0.1:${CAREHUB_PORT:-8040}:8000"
+    volumes:
+      - data:/usr/src/paperless/data
+      - media:/usr/src/paperless/media
+      - ./export:/usr/src/paperless/export
+      - ./consume:/usr/src/paperless/consume
+      - ./branding:/usr/src/paperless/branding:ro
+    env_file: .env
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_DBENGINE: sqlite
+      PAPERLESS_TIME_ZONE: Australia/Melbourne
+      PAPERLESS_OCR_LANGUAGE: eng
+      # Demo documents are born-digital PDFs; only OCR pages that have no text.
+      PAPERLESS_OCR_MODE: auto
+      PAPERLESS_APP_TITLE: CareHub
+      PAPERLESS_ACCOUNT_ALLOW_SIGNUPS: "false"
+      PAPERLESS_AUDIT_LOG_ENABLED: "true"
+      PAPERLESS_ENABLE_UPDATE_CHECK: "false"
+      # Small-server tuning (2 vCPU). Raise these on a bigger machine.
+      PAPERLESS_WEBSERVER_WORKERS: "1"
+      PAPERLESS_TASK_WORKERS: "1"
+      PAPERLESS_THREADS_PER_WORKER: "1"
+      # AI: chat across documents, and tag/type suggestions.
+      # Embeddings run locally on the CPU, so document text is indexed in-house.
+      PAPERLESS_AI_ENABLED: "true"
+      PAPERLESS_AI_LLM_EMBEDDING_BACKEND: huggingface
+      PAPERLESS_AI_LLM_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      # The embedding model is cached in the data volume after the first
+      # document is indexed. Set HF_HUB_OFFLINE=1 in .env after that, so each
+      # question doesn't wait on an online version check (about 45 s here).
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    mem_limit: 2g
+
+volumes:
+  data:
+  media:
+  redisdata:
