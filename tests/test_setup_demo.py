@@ -560,3 +560,122 @@ def test_main_reports_runtime_errors_without_traceback(fake, out_dir, capsys):
     assert run_main(fake, out_dir) == 1
     err = capsys.readouterr().err
     assert "HTTP 500" in err and "Traceback" not in err
+
+
+# --------------------------------------------------------------------------- demo guide
+
+
+def guide_view(fake: FakePaperless) -> dict:
+    views = [v for v in fake.saved_views.values() if v["name"] == S.GUIDE_VIEW]
+    assert len(views) == 1
+    return views[0]
+
+
+def assert_guide_pinned_first(fake: FakePaperless, username: str, view_id: int) -> dict:
+    stored = fake.ui_settings[fake.user_id(username)]["saved_views"]
+    for visible_key, order_key in S.PIN_LISTS:
+        assert view_id in stored[visible_key], (username, visible_key)
+        assert stored[order_key][0] == view_id, (username, order_key)
+    return stored
+
+
+def test_guide_document_is_readable_by_every_group_and_editable_by_none(fake, out_dir, manifest):
+    make_seeder(fake, out_dir, manifest).run()
+    guide = [m for m in manifest if S.GUIDE_TAG in m["tags"]]
+    assert len(guide) == 1 and guide[0]["access"] == "guide"
+    doc = fake.doc_by_key(guide[0]["key"])[0]
+    gids = group_ids(fake)
+    assert doc["perms"]["view"]["groups"] == sorted(gids[g] for g in S.GROUPS)
+    assert doc["perms"]["change"] == {"users": [], "groups": []}
+
+
+def test_guide_is_pinned_first_for_every_account(fake, out_dir, manifest):
+    summary = make_seeder(fake, out_dir, manifest, env={"DEMO_TEST_PASSWORD": "tester-pw"}).run()
+    view = guide_view(fake)
+    tag_id = next(t["id"] for t in fake.objects["tags"].values() if t["name"] == S.GUIDE_TAG)
+    assert view["filter_rules"] == [{"rule_type": S.HAS_TAG_RULE, "value": str(tag_id)}]
+    assert view["owner"] == fake.admin_id
+    assert view["perms"]["view"]["groups"] == sorted(group_ids(fake)[g] for g in S.GROUPS)
+    assert view["perms"]["change"]["groups"] == []
+    accounts = ["admin", "demo.manager", "demo.admin", "demo.carer", "test.user"]
+    for username in accounts:
+        assert_guide_pinned_first(fake, username, view["id"])
+    assert sorted(summary.guide_pinned) == sorted(accounts)
+
+
+def test_guide_is_pinned_again_after_a_user_unpins_it(fake, out_dir, manifest):
+    make_seeder(fake, out_dir, manifest).run()
+    view_id = guide_view(fake)["id"]
+    carer = fake.user_id("demo.carer")
+    fake.ui_settings[carer] = {"dark_mode": {"enabled": True},
+                               "saved_views": {"dashboard_views_visible_ids": [555],
+                                               "dashboard_views_sort_order": [555],
+                                               "sidebar_views_visible_ids": [],
+                                               "sidebar_views_sort_order": []}}
+    make_seeder(fake, out_dir, manifest).run()
+    stored = fake.ui_settings[carer]
+    assert stored["dark_mode"] == {"enabled": True}  # the user's own settings survive
+    pins = assert_guide_pinned_first(fake, "demo.carer", view_id)
+    assert pins["dashboard_views_visible_ids"] == [555, view_id]
+    assert pins["dashboard_views_sort_order"] == [view_id, 555]
+
+
+def test_pinning_does_not_store_server_supplied_settings(fake, out_dir, manifest):
+    make_seeder(fake, out_dir, manifest).run()
+    for stored in fake.ui_settings.values():
+        assert not set(stored) & S.SERVER_UI_KEYS
+        assert "backend_setting" not in stored.get("update_checking", {})
+
+
+def test_deleted_or_drifted_guide_view_is_restored(fake, out_dir, manifest):
+    make_seeder(fake, out_dir, manifest).run()
+    view = guide_view(fake)
+    view["filter_rules"] = []
+    view["perms"]["view"]["groups"] = []
+    make_seeder(fake, out_dir, manifest).run()
+    assert guide_view(fake)["filter_rules"] != []
+    assert guide_view(fake)["perms"]["view"]["groups"] == sorted(group_ids(fake)[g] for g in S.GROUPS)
+    del fake.saved_views[view["id"]]
+    make_seeder(fake, out_dir, manifest).run()
+    new_id = guide_view(fake)["id"]
+    assert new_id != view["id"]
+    for username in ("admin", "demo.manager", "demo.admin", "demo.carer"):
+        assert_guide_pinned_first(fake, username, new_id)
+
+
+def test_account_with_changed_password_is_reported_not_fatal(fake, out_dir, manifest):
+    make_seeder(fake, out_dir, manifest).run()
+    fake.users[fake.user_id("demo.carer")]["password"] = "changed-by-the-user"
+    fake.ui_settings.pop(fake.user_id("demo.carer"))
+    seeder = make_seeder(fake, out_dir, manifest)
+    summary = seeder.run()
+    assert summary.guide_not_pinned == ["demo.carer"]
+    assert any("guide not pinned for 'demo.carer'" in line for line in seeder.lines)
+    assert fake.user_id("demo.carer") not in fake.ui_settings
+
+
+def test_dry_run_reports_guide_pinning_without_writing(fake, out_dir, manifest):
+    make_seeder(fake, out_dir, manifest).run()
+    fake.ui_settings.clear()
+    before = len(fake.mutations())
+    seeder = make_seeder(fake, out_dir, manifest, options=S.Options(dry_run=True), state=False)
+    seeder.run()
+    assert len(fake.mutations()) == before
+    assert sum("would pin" in line for line in seeder.lines) == 4
+
+
+def test_pin_first_keeps_other_views_and_is_idempotent():
+    once = S.pin_first({"dashboard_views_visible_ids": [3, 1], "dashboard_views_sort_order": [1]}, 7)
+    assert once["dashboard_views_visible_ids"] == [3, 1, 7]
+    assert once["dashboard_views_sort_order"] == [7, 1, 3]
+    assert once["sidebar_views_visible_ids"] == [7] and once["sidebar_views_sort_order"] == [7]
+    assert S.pin_first(once, 7) == once
+
+
+def test_guide_text_holds_no_credentials_or_answers():
+    import make_docs
+    guide = next(d for d in make_docs.DOCS if make_docs.GUIDE_TAG in d["tags"])
+    text = json.dumps(guide)
+    assert "Bluegum-" not in text  # live demo password prefix
+    for spoiler in ("GST", "383", "K. Lee", "front car park", "3 February"):
+        assert spoiler not in text, spoiler

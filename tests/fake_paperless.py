@@ -20,6 +20,7 @@ through interruptions and failures deterministically.
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from collections.abc import Callable
@@ -47,6 +48,8 @@ class FakePaperless(BaseAdapter):
         self.documents: dict[int, dict] = {}
         self.tasks: dict[str, dict] = {}
         self.objects: dict[str, dict[int, dict]] = {"tags": {}, "document_types": {}, "correspondents": {}}
+        self.saved_views: dict[int, dict] = {}
+        self.ui_settings: dict[int, dict] = {}  # user id -> stored settings (UiSettings.settings)
         self.uploads: list[dict] = []
         self.requests: list[tuple[str, str]] = []
         self.interceptors: list[Callable[[requests.PreparedRequest, str, str], requests.Response | None]] = []
@@ -134,10 +137,92 @@ class FakePaperless(BaseAdapter):
             nxt = f"{parts.scheme}://{parts.netloc}{parts.path}?" + "&".join(f"{k}={v}" for k, v in q.items())
         return {"count": len(items), "next": nxt, "previous": None, "results": chunk}
 
+    def caller(self, request) -> dict | None:
+        """The user named by HTTP Basic auth, or None when the password does not match.
+
+        Users created without a password (the fixture admin) accept any password.
+        """
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return None
+        username, _, password = base64.b64decode(header[6:]).decode().partition(":")
+        user = next((u for u in self.users.values() if u["username"] == username), None)
+        if user is None or (user.get("password") is not None and user["password"] != password):
+            return None
+        return user
+
+    def user_id(self, username: str) -> int:
+        return next(u["id"] for u in self.users.values() if u["username"] == username)
+
+    def route_ui_settings(self, request, method, body):
+        user = self.caller(request)
+        if user is None:
+            return 401, {"detail": "Invalid username/password."}
+        if method == "GET":
+            stored = json.loads(json.dumps(self.ui_settings.get(user["id"], {})))
+            stored.setdefault("update_checking", {})["backend_setting"] = False
+            stored.update(trash_delay=30, version="3.4.2", app_title="CareHub", ai_enabled=True)
+            return 200, {"user": {"id": user["id"], "username": user["username"],
+                                  "is_superuser": user["is_superuser"]},
+                         "settings": stored, "permissions": []}
+        if method == "POST":
+            settings = dict(body.get("settings") or {})
+            if "update_checking" in settings:
+                settings["update_checking"] = {k: v for k, v in settings["update_checking"].items()
+                                               if k != "backend_setting"}
+            self.ui_settings[user["id"]] = settings
+            return 200, {"success": True}
+        raise KeyError("ui_settings")
+
+    def route_saved_views(self, request, method, segs, query, body):
+        full = query.get("full_perms") == "true"
+
+        def out(view):
+            pub = {k: v for k, v in view.items() if k != "perms"}
+            if full:
+                pub["permissions"] = json.loads(json.dumps(view["perms"]))
+            return pub
+
+        def apply(view, data):
+            for key in ("name", "icon", "sort_field", "sort_reverse", "owner"):
+                if key in data:
+                    view[key] = data[key]
+            if "filter_rules" in data:
+                view["filter_rules"] = [{"rule_type": r["rule_type"], "value": r["value"]} for r in data["filter_rules"]]
+            if "set_permissions" in data:
+                for action in ("view", "change"):
+                    entry = data["set_permissions"].get(action) or {}
+                    view["perms"][action] = {"users": sorted(entry.get("users", [])),
+                                             "groups": sorted(entry.get("groups", []))}
+                view["perms"]["view"]["groups"] = sorted(set(view["perms"]["view"]["groups"])
+                                                         | set(view["perms"]["change"]["groups"]))
+
+        if len(segs) == 1 and method == "GET":
+            return 200, self.page(request, [out(v) for v in self.saved_views.values()], query)
+        if len(segs) == 1 and method == "POST":
+            vid = self._id()
+            view = {"id": vid, "name": "", "icon": "funnel", "sort_field": None, "sort_reverse": False,
+                    "filter_rules": [], "owner": self.caller(request)["id"],
+                    "perms": {"view": {"users": [], "groups": []}, "change": {"users": [], "groups": []}}}
+            apply(view, body)
+            self.saved_views[vid] = view
+            return 201, out(view)
+        view = self.saved_views[int(segs[1])]
+        if method == "PATCH":
+            apply(view, body)
+            return 200, out(view)
+        if method == "GET":
+            return 200, out(view)
+        raise KeyError(segs)
+
     def route(self, request, method: str, path: str, query: dict):
         segs = [s for s in path.split("/") if s][1:]  # drop "api"
         body = json.loads(request.body) if request.body and "json" in request.headers.get("Content-Type", "") else None
         coll = segs[0]
+        if coll == "ui_settings":
+            return self.route_ui_settings(request, method, body)
+        if coll == "saved_views":
+            return self.route_saved_views(request, method, segs, query, body)
         if coll == "documents":
             return self.route_documents(request, method, segs, query, body)
         if coll == "tasks":

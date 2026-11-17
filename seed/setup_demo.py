@@ -15,6 +15,9 @@ What a re-run does (see README "Loading the demo" for the full contract):
 * Group permission sets and demo-user names, flags and group memberships are
   reconciled. Passwords are only set when a user is created, or with
   --reset-passwords.
+* The demo guide (a read-only document every demo group can view) is kept as
+  a shared saved view and pinned first on the dashboard and sidebar of the
+  admin and every demo account with a configured password, on every run.
 * The target must look like a fresh instance or one this tool has seeded
   before (the custom field above exists). Anything else (existing documents,
   groups or users with the demo names) is refused unless --adopt-existing is
@@ -100,12 +103,30 @@ ACCESS = {
     "clinical": (["Care Managers"], ["Care Managers"]),
     "finance": (["Finance", "Admin Officers"], ["Finance", "Admin Officers"]),
     "finance_only": (["Finance"], ["Finance"]),
+    "guide": (["All Staff", "Admin Officers", "Care Managers", "Finance"], []),
 }
 
 TAG_COLOURS = {
     "Current version": "#16a34a", "Superseded": "#dc2626", "Confidential": "#7c3aed",
-    "Awaiting approval": "#f59e0b", "Paid": "#0ea5e9",
+    "Awaiting approval": "#f59e0b", "Paid": "#0ea5e9", "Demo guide": "#2563eb",
 }
+
+# The demo guide is pinned for every account the seeder can sign in as: a saved
+# view (documents tagged GUIDE_TAG) shared with every demo group, listed first
+# on each user's dashboard and sidebar. Paperless-ngx 3.4.2 keeps those pins
+# per user in UiSettings.settings["saved_views"] (documents/serialisers.py
+# SavedViewSerializer._update_legacy_visibility_preferences), and
+# POST /api/ui_settings/ replaces the caller's whole settings object, so pins
+# are merged into what each user already has.
+GUIDE_TAG = "Demo guide"
+GUIDE_VIEW = "Demo guide - start here"
+GUIDE_VIEW_ICON = "journals"  # SavedView.Icon choice upstream
+HAS_TAG_RULE = 6  # SavedViewFilterRule "has tag"
+PIN_LISTS = (("dashboard_views_visible_ids", "dashboard_views_sort_order"),
+             ("sidebar_views_visible_ids", "sidebar_views_sort_order"))
+# Keys GET /api/ui_settings/ adds from server configuration; never stored back.
+SERVER_UI_KEYS = {"trash_delay", "version", "app_title", "app_logo", "auditlog_enabled", "remote_ocr",
+                  "email_enabled", "ai_enabled", "gmail_oauth_url", "outlook_oauth_url"}
 
 MANIFEST_FIELDS = ("key", "file", "title", "created", "type", "correspondent", "tags", "access")
 
@@ -268,6 +289,14 @@ class PaperlessClient:
         self.sleep = sleep
         self.clock = clock
         self._origin = urlsplit(self.base)[:2]
+
+    def as_user(self, username: str, password: str) -> PaperlessClient:
+        """A client for another account on the same server, reusing this one's transport."""
+        session = requests.Session()
+        session.adapters = self.session.adapters
+        settings = Settings(**{**self.settings.__dict__, "admin_user": username, "admin_password": password})
+        return PaperlessClient(settings, session=session, get_retries=self.get_retries, sleep=self.sleep,
+                               clock=self.clock)
 
     def _url(self, path: str) -> str:
         if path.startswith(("http://", "https://")):
@@ -475,6 +504,8 @@ class Summary:
     unchanged: list[str] = field(default_factory=list)
     adopted: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    guide_pinned: list[str] = field(default_factory=list)
+    guide_not_pinned: list[str] = field(default_factory=list)
 
 
 def _desired_permissions(access: str, group_ids: Mapping[str, int]) -> dict:
@@ -517,11 +548,12 @@ class Seeder:
         self._placeholder -= 1
         return self._placeholder
 
-    def _mutate(self, method: str, path: str, what: str, **kwargs: Any) -> Any:
+    def _mutate(self, method: str, path: str, what: str, client: PaperlessClient | None = None,
+                **kwargs: Any) -> Any:
         if self.options.dry_run:
             self.log(f"[dry-run] would {what}")
             return None
-        return self.client.request(method, path, **kwargs)
+        return (client or self.client).request(method, path, **kwargs)
 
     # -- phases
 
@@ -533,9 +565,12 @@ class Seeder:
         self.sync_users(snapshot["users"], group_ids)
         for doc in self.manifest:
             self.sync_document(doc, group_ids)
+        view_id = self.sync_guide_view(group_ids)
+        self.pin_guide(view_id)
         s = self.summary
         self.log(f"done: {len(s.uploaded)} uploaded, {len(s.adopted)} adopted, {len(s.reconciled)} permissions fixed, "
-                 f"{len(s.unchanged)} unchanged, {len(s.skipped)} skipped")
+                 f"{len(s.unchanged)} unchanged, {len(s.skipped)} skipped; guide pinned for "
+                 f"{len(s.guide_pinned)} account(s)")
         return s
 
     def preflight(self) -> dict:
@@ -765,6 +800,118 @@ class Seeder:
                            f"(wanted {desired}, server reports {after.get('permissions')})")
         self.summary.reconciled.append(doc["key"])
         self.log(f"permissions set #{current['id']} [{doc['access']}] {doc['title']}")
+
+    # -- demo guide
+
+    def _guide_tag_id(self) -> int | None:
+        for tag in self.client.list_all("tags/", {"name__iexact": GUIDE_TAG}):
+            if tag.get("name") == GUIDE_TAG:
+                return tag["id"]
+        return None
+
+    def sync_guide_view(self, group_ids: Mapping[str, int]) -> int | None:
+        """Ensure the shared "Demo guide" saved view exists, filtered on the guide tag."""
+        if not any(GUIDE_TAG in d["tags"] for d in self.manifest):
+            return None
+        tag_id = self._guide_tag_id()
+        if tag_id is None:
+            if self.options.dry_run:
+                self.log(f"[dry-run] would create saved view {GUIDE_VIEW!r} and pin it once the guide is uploaded")
+                return None
+            tag_id = self.ensure("tags", GUIDE_TAG, {"color": TAG_COLOURS[GUIDE_TAG], "matching_algorithm": 0,
+                                                     "owner": None})
+        perms = {"view": {"users": [], "groups": sorted(group_ids[g] for g in GROUPS)},
+                 "change": {"users": [], "groups": []}}
+        desired = {"name": GUIDE_VIEW, "icon": GUIDE_VIEW_ICON, "sort_field": "created", "sort_reverse": True,
+                   "filter_rules": [{"rule_type": HAS_TAG_RULE, "value": str(tag_id)}]}
+        views = [v for v in self.client.list_all("saved_views/", {"full_perms": "true"})
+                 if v.get("name") == GUIDE_VIEW and v.get("owner") == self.admin_id]
+        if len(views) > 1:
+            raise ImportConflict(f"{len(views)} saved views named {GUIDE_VIEW!r} (ids {sorted(v['id'] for v in views)}); "
+                                 "delete the extras manually")
+        if not views:
+            created = self._mutate("POST", "saved_views/", f"create saved view {GUIDE_VIEW!r}",
+                                   json_body={**desired, "owner": self.admin_id, "set_permissions": perms},
+                                   expect=(201,))
+            if created is None:  # dry run
+                return None
+            self.log(f"saved view {GUIDE_VIEW!r}: created")
+            return created["id"]
+        view = views[0]
+        changes: dict[str, Any] = {}
+        rules = sorted((int(r.get("rule_type", -1)), str(r.get("value"))) for r in view.get("filter_rules") or [])
+        if rules != [(HAS_TAG_RULE, str(tag_id))]:
+            changes["filter_rules"] = desired["filter_rules"]
+        for key in ("icon", "sort_field", "sort_reverse"):
+            if view.get(key) != desired[key]:
+                changes[key] = desired[key]
+        if _normalise_permissions(view.get("permissions")) != perms:
+            changes["set_permissions"] = perms
+        if changes:
+            self._mutate("PATCH", f"saved_views/{view['id']}/",
+                         f"update saved view {GUIDE_VIEW!r} ({', '.join(sorted(changes))})", json_body=changes)
+            self.log(f"saved view {GUIDE_VIEW!r}: reconciled {', '.join(sorted(changes))}")
+        return view["id"]
+
+    def _accounts(self) -> Iterable[tuple[str, str]]:
+        yield self.settings.admin_user, self.settings.admin_password
+        for user in USERS:
+            password = self.settings.user_passwords.get(user.username)
+            if password:
+                yield user.username, password
+
+    def pin_guide(self, view_id: int | None) -> None:
+        """Pin the guide first on the dashboard and sidebar of every account the seeder can sign in as.
+
+        Re-run safe: an account that already has it pinned first is not written to,
+        and other settings are kept. An account whose password no longer matches
+        the configured one is reported and skipped, not treated as a failure.
+        """
+        if view_id is None:
+            return
+        for username, password in self._accounts():
+            client = self.client if username == self.settings.admin_user else self.client.as_user(username, password)
+            try:
+                data = client.request("GET", "ui_settings/")
+            except ApiError as exc:
+                if exc.status in (401, 403):
+                    self.log(f"warning: guide not pinned for {username!r}: sign-in failed (HTTP {exc.status}); "
+                             "the password may have been changed. Pin it from that account, or re-run with "
+                             "--reset-passwords.")
+                    self.summary.guide_not_pinned.append(username)
+                    continue
+                raise
+            current = data.get("settings") if isinstance(data, dict) else None
+            if not isinstance(current, dict):
+                raise ApiError("GET /api/ui_settings/: malformed response (no 'settings' object)")
+            stored = {k: v for k, v in current.items() if k not in SERVER_UI_KEYS}
+            update_checking = dict(stored.get("update_checking") or {})
+            update_checking.pop("backend_setting", None)
+            if update_checking:
+                stored["update_checking"] = update_checking
+            else:
+                stored.pop("update_checking", None)
+            pins = stored.get("saved_views") if isinstance(stored.get("saved_views"), dict) else {}
+            wanted = pin_first(pins, view_id)
+            if wanted != pins:
+                self._mutate("POST", "ui_settings/", f"pin {GUIDE_VIEW!r} first for {username!r}", client=client,
+                             json_body={"settings": {**stored, "saved_views": wanted}})
+                self.log(f"guide pinned for {username}")
+            self.summary.guide_pinned.append(username)
+
+
+def pin_first(saved_views: Mapping[str, Any], view_id: int) -> dict:
+    """Return saved-view UI settings with `view_id` visible and first on dashboard and sidebar."""
+    out = dict(saved_views)
+    for visible_key, order_key in PIN_LISTS:
+        visible = list(out.get(visible_key) or [])
+        if view_id not in visible:
+            visible.append(view_id)
+        order = [i for i in (out.get(order_key) or []) if i != view_id]
+        order += [i for i in visible if i not in order and i != view_id]
+        out[visible_key] = visible
+        out[order_key] = [view_id] + order
+    return out
 
 
 # --------------------------------------------------------------------------- CLI

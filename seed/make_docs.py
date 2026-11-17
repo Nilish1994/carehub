@@ -30,8 +30,49 @@ KEY_PREFIX = "carehub-demo:"
 
 # Access levels map to groups in setup_demo.py
 ALL, ADMIN, CLINICAL, FINANCE, FINANCE_ONLY = "all", "admin", "clinical", "finance", "finance_only"
+GUIDE = "guide"  # every demo group may view, nobody may edit
+
+# The guide is a document like the others, so the AI chat can read it too.
+# Suggest what to ask; never write the answers (or any password) into it.
+GUIDE_TAG = "Demo guide"
 
 DOCS: list[dict] = [
+    {
+        "file": "GUIDE-000 CareHub Demo Guide - start here.pdf",
+        "title": "CareHub Demo Guide - start here",
+        "created": "2026-11-17", "type": "Guide", "correspondent": "CareHub",
+        "tags": [GUIDE_TAG], "access": GUIDE, "keep_headings": True,
+        "meta": [("Audience", "Everyone using this demo"),
+                 ("Where to find it", "Pinned on the dashboard and in the sidebar of every demo account"),
+                 ("Data", "Fictional facility, people and figures only")],
+        "body": [
+            ("h", "1. What this demo is"),
+            ("p", "CareHub is an open-source document hub for aged-care admin teams, built on Paperless-ngx. Every document here belongs to a made-up facility, Bluegum Ridge Care Community. No real people, residents or organisation data are used."),
+            ("h", "2. Demo accounts"),
+            ("tw", {"widths": [0.22, 0.22, 0.56], "rows": [
+                ["Username", "Role", "What it can see"],
+                ["demo.manager", "Facility manager", "Everything, including invoices, the budget and resident records"],
+                ["demo.admin", "Admin officer", "Policies, forms, rosters, invoices, contracts, minutes, training and service reports"],
+                ["demo.carer", "Care worker", "Policies, procedures, forms, rosters and this guide"]]}),
+            ("p", "Passwords are not written in any document. The person running the demo gives them to you."),
+            ("h", "3. Ask questions in plain English"),
+            ("p", "Click the chat icon at the top right and type a question. The answer lists the documents it used; click one to open it. The first question after the server restarts can take about 30 seconds; later ones are quicker."),
+            ("tw", {"widths": [0.55, 0.45], "rows": [
+                ["Try asking", "What it shows"],
+                ["Where is the fire assembly point?", "Two versions of the fire policy exist. See which one the answer relies on."],
+                ["Who is the fire warden on the Monday afternoon shift?", "Combines the roster with the policy."],
+                ["Which staff are overdue for fire safety training, and are they rostered this week?", "Cross-checks two documents."],
+                ["By when must we give notice to end the linen contract?", "Finds a date inside a contract."],
+                ["Check the Coastal Linen October invoice before I approve it.", "Reviews figures, not just finds them."]]}),
+            ("h", "4. See the permission layers"),
+            ("p", "Sign in as demo.carer and ask about the Coastal Linen invoice. Then sign in as demo.admin and ask about the resident in room 12. Each account only lists, searches and gets AI answers from the documents its groups may view."),
+            ("h", "5. Find documents without the AI"),
+            ("p", "Use the search bar for words inside documents, or filter the Documents list by tag, document type, supplier or date. Tags such as 'Current version' and 'Superseded' are labels for people; they do not control who can see a document."),
+            ("h", "6. Good to know"),
+            ("p", "Do not upload real documents or personal information. In this online demo, passages relevant to a chat question are sent to a hosted AI model to write the answer; a production setup would run the model on the organisation's own hardware."),
+            ("p", "This guide is read-only. If it is removed from a dashboard or sidebar, the setup script pins it again."),
+        ],
+    },
     {
         "file": "POL-FS-004 Fire Safety and Emergency Evacuation Policy v4.pdf",
         "title": "Fire Safety and Emergency Evacuation Policy v4",
@@ -390,7 +431,10 @@ def build(doc: dict, out: Path) -> None:
     story += [meta, Spacer(1, 5 * mm)]
     for kind, content in doc["body"]:
         if kind == "h":
-            story.append(Paragraph(content, styles["Heading3"]))
+            heading = styles["Heading3"]
+            if doc.get("keep_headings"):  # never strand a heading at the foot of a page
+                heading = heading.clone("h-keep", keepWithNext=1)
+            story.append(Paragraph(content, heading))
         elif kind == "p":
             story += [Paragraph(content, styles["BodyText"]), Spacer(1, 2 * mm)]
         elif kind == "t":
@@ -400,6 +444,18 @@ def build(doc: dict, out: Path) -> None:
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]))
+            story += [table, Spacer(1, 3 * mm)]
+        elif kind == "tw":  # wrapping table: cells are paragraphs, columns are fractions of the text width
+            cell = styles["BodyText"].clone("tw-cell", fontSize=8.5, leading=10.5)
+            head = cell.clone("tw-head", fontName="Helvetica-Bold", textColor=colors.white)
+            rows = [[Paragraph(c, head if r == 0 else cell) for c in row] for r, row in enumerate(content["rows"])]
+            text_width = A4[0] - 36 * mm
+            table = Table(rows, colWidths=[f * text_width for f in content["widths"]], repeatRows=1, hAlign="LEFT")
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f5f5b")),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ]))

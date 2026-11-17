@@ -112,6 +112,15 @@ What the loader guarantees:
 - **It reconciles groups and demo users** (group permission sets; demo users'
   names, flags and group membership). It sets passwords only when it creates
   a user, unless you pass `--reset-passwords`.
+- **It pins the demo guide for everyone.** "CareHub Demo Guide - start here"
+  is a read-only document every demo group can view. The loader keeps a shared
+  saved view, "Demo guide - start here", and pins it first on the dashboard
+  and sidebar of the admin and every demo account it has a password for.
+  Paperless stores those pins per user, so each run re-pins the guide for
+  anyone who removed it and keeps their other settings. An account whose
+  password no longer matches is reported and skipped. Accounts created
+  outside the loader do not get the pin automatically. The AI chat can read
+  the guide too, so it suggests questions without giving the answers.
 - **Every request is bounded.** HTTP calls time out (`CAREHUB_SEED_HTTP_TIMEOUT`,
   default 30 s), waiting for the API and for each upload to be processed
   has a deadline (`CAREHUB_SEED_READY_TIMEOUT`, `CAREHUB_SEED_TASK_TIMEOUT`,
