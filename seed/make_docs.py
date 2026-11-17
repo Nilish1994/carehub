@@ -3,6 +3,11 @@
 Everything here is invented for a demo: the facility, people, residents,
 suppliers and figures. Every page carries a "fictional demo document" footer.
 
+Output is byte-for-byte reproducible (ReportLab invariant mode), and every
+manifest entry carries a stable import `key` that setup_demo.py uses to
+recognise documents it has already uploaded. Keys are derived from the file
+name; do not rename files of an instance that has already been seeded.
+
 Usage (needs reportlab):  python make_docs.py out/
 """
 
@@ -20,6 +25,8 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 FACILITY = "Bluegum Ridge Care Community"
 ADDRESS = "14 Bluegum Avenue, Ridgeview VIC 3999 (fictional)"
+
+KEY_PREFIX = "carehub-demo:"
 
 # Access levels map to groups in setup_demo.py
 ALL, ADMIN, CLINICAL, FINANCE, FINANCE_ONLY = "all", "admin", "clinical", "finance", "finance_only"
@@ -365,6 +372,10 @@ DOCS: list[dict] = [
 ]
 
 
+def import_key(doc: dict) -> str:
+    return KEY_PREFIX + Path(doc["file"]).stem
+
+
 def build(doc: dict, out: Path) -> None:
     styles = getSampleStyleSheet()
     story = [
@@ -402,16 +413,18 @@ def build(doc: dict, out: Path) -> None:
         canvas.restoreState()
 
     SimpleDocTemplate(str(out / doc["file"]), pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
-                      topMargin=16 * mm, bottomMargin=18 * mm, title=doc["title"]).build(
+                      topMargin=16 * mm, bottomMargin=18 * mm, title=doc["title"], invariant=1).build(
         story, onFirstPage=footer, onLaterPages=footer)
 
 
-def main() -> None:
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else "out")
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    out = Path(argv[0] if argv else "out")
     out.mkdir(parents=True, exist_ok=True)
     for doc in DOCS:
         build(doc, out)
-    manifest = [{k: d[k] for k in ("file", "title", "created", "type", "correspondent", "tags", "access")} for d in DOCS]
+    manifest = [{"key": import_key(d), **{k: d[k] for k in ("file", "title", "created", "type", "correspondent",
+                                                             "tags", "access")}} for d in DOCS]
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"wrote {len(DOCS)} PDFs to {out}")
 

@@ -4,3 +4,6 @@ seed/out/
 export/
 consume/
 __pycache__/
+.venv/
+.pytest_cache/
+*.pyc
