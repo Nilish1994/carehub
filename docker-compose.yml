@@ -7,23 +7,32 @@
 #   docker compose up -d
 #
 # The web app listens on 127.0.0.1:${CAREHUB_PORT} only; put a reverse proxy
-# with HTTPS (nginx, Caddy) in front of it to publish it.
+# with HTTPS (nginx, Caddy) in front of it to publish it, pointing at the same
+# port. Check a .env with: python tools/check_config.py
+#
+# Images are pinned by tag and digest so every install runs the same build.
+# The valkey digest is what 9-alpine resolved to on 2026-11-17 (9.1.3);
+# compare with `docker image inspect` on an existing host before pulling.
 
 services:
   broker:
-    image: docker.io/valkey/valkey:9-alpine
+    image: docker.io/valkey/valkey:9.1.3-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
     restart: unless-stopped
     volumes:
       - redisdata:/data
     mem_limit: 128m
 
   webserver:
-    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2@sha256:d704e84f88300eb6ab001ab15720a2330ff99169cf9f94d6b8fcc44b63a84c84
     restart: unless-stopped
     depends_on:
       - broker
     ports:
       - "127.0.0.1:${CAREHUB_PORT:-8040}:8000"
+    # Lets the container reach an Ollama server on the Docker host
+    # (AI option B). Docker Desktop provides this name already; Linux needs it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - data:/usr/src/paperless/data
       - media:/usr/src/paperless/media
@@ -47,10 +56,12 @@ services:
       PAPERLESS_TASK_WORKERS: "1"
       PAPERLESS_THREADS_PER_WORKER: "1"
       # AI: chat across documents, and tag/type suggestions.
-      # Embeddings run locally on the CPU, so document text is indexed in-house.
+      # Values in `environment` override env_file, so the embedding settings
+      # are read from .env here (the AI option blocks in .env.example) and only
+      # default to local CPU embeddings with MiniLM when .env leaves them unset.
       PAPERLESS_AI_ENABLED: "true"
-      PAPERLESS_AI_LLM_EMBEDDING_BACKEND: huggingface
-      PAPERLESS_AI_LLM_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      PAPERLESS_AI_LLM_EMBEDDING_BACKEND: ${PAPERLESS_AI_LLM_EMBEDDING_BACKEND:-huggingface}
+      PAPERLESS_AI_LLM_EMBEDDING_MODEL: ${PAPERLESS_AI_LLM_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       # The embedding model is cached in the data volume after the first
       # document is indexed. Set HF_HUB_OFFLINE=1 in .env after that, so each
       # question doesn't wait on an online version check (about 45 s here).
